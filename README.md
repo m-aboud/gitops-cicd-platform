@@ -228,4 +228,4 @@ Combined with the AnalysisTemplate (`success-rate` queried against Prometheus), 
 
 ## 📄 License
 
-[MIT](LICENSE) © Mohammed Abood
+[MIT](LICENSE) © Mohammed Aboud
