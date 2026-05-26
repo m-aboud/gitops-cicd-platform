@@ -1,0 +1,33 @@
+# EventSource — accepts HTTP webhooks from CI (GitHub Actions, GHCR, etc.)
+# Exposed at: https://events.example.com/release  (via Ingress)
+#
+# Payload schema (POST JSON):
+#   {
+#     "app":         "demo-api",
+#     "environment": "prod",
+#     "image":       "ghcr.io/mohammedabood/demo-api@sha256:abc123...",
+#     "version":     "1.2.3",
+#     "git_sha":     "abcdef1",
+#     "actor":       "github-actions[bot]"
+#   }
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: release-webhook
+  namespace: argo-events
+spec:
+  service:
+    ports:
+      - name: tcp
+        port: 12000
+        targetPort: 12000
+  webhook:
+    release:
+      port: "12000"
+      endpoint: /release
+      method: POST
+      # HMAC verification — set the shared secret in the CI pipeline as
+      # ARGO_EVENTS_WEBHOOK_SECRET. The Sensor's data filter checks the digest.
+      authSecret:
+        name: argo-events-webhook-secret
+        key: secret

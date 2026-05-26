@@ -1,0 +1,273 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/demo-api/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/demo-api/**"
+      - ".github/workflows/ci.yml"
+
+# Required for keyless Cosign signing (OIDC), and for build-attestation.
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+  attestations: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/demo-api
+
+jobs:
+  # -----------------------------------------------------------------
+  # 1. Lint + test
+  # -----------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/demo-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: apps/demo-api/requirements-dev.txt
+
+      - name: Install deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: pytest with coverage
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: apps/demo-api/coverage.xml
+          retention-days: 1
+
+  # -----------------------------------------------------------------
+  # 1b. SonarCloud — SAST + quality gate
+  # -----------------------------------------------------------------
+  sonarcloud:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # SonarCloud needs full history for blame-based new-code detection
+          fetch-depth: 0
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: apps/demo-api/
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # The action fails the job automatically when the quality gate fails
+      # (because sonar.qualitygate.wait=true in sonar-project.properties).
+
+  # -----------------------------------------------------------------
+  # 2. Build, scan, sign, push
+  # -----------------------------------------------------------------
+  build-and-sign:
+    needs: [test, sonarcloud]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/demo-api
+          file: apps/demo-api/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----- Vulnerability scan with Trivy -----
+      - name: Trivy scan (high+critical, fail on fixed)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ----- SBOM -----
+      - name: Generate SBOM (Syft, CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      # ----- Cosign keyless signing -----
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign the image (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes --predicate sbom.cdx.json --type cyclonedx \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      # ----- SLSA provenance attestation (GitHub-native) -----
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # -----------------------------------------------------------------
+  # 3. Auto-bump the dev overlay tag (basic example).
+  #    For full GitOps, use Argo CD Image Updater or Renovate K8s manifest mode.
+  # -----------------------------------------------------------------
+  bump-deployments:
+    needs: build-and-sign
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump dev overlay image tag
+        run: |
+          NEW_TAG="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+          sed -i "s|newTag: .*|newTag: \"${NEW_TAG}\"|" \
+            deployments/apps/demo-api/overlays/dev/kustomization.yaml
+
+      - name: Open PR with bump
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(deploy): bump demo-api dev to sha-${{ github.sha }}"
+          branch: "auto/bump-demo-api-${{ github.run_id }}"
+          title: "chore(deploy): bump demo-api dev"
+          body: |
+            Auto-generated by CI run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            New image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-sign.outputs.image-digest }}`
+          labels: |
+            automated
+            deployment
+
+  # -----------------------------------------------------------------
+  # 4. Fire event into Argo Events for immediate CD (in parallel with PR bump)
+  # -----------------------------------------------------------------
+  fire-release-event:
+    needs: build-and-sign
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST to Argo Events webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.ARGO_EVENTS_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.ARGO_EVENTS_WEBHOOK_SECRET }}
+          IMAGE: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-sign.outputs.image-digest }}"
+          VERSION: ${{ needs.build-and-sign.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -nc \
+            --arg app   demo-api \
+            --arg env   dev \
+            --arg img   "$IMAGE" \
+            --arg ver   "$VERSION" \
+            --arg sha   "${GITHUB_SHA::7}" \
+            --arg actor "$GITHUB_ACTOR" \
+            '{ app:$app, environment:$env, image:$img, version:$ver, git_sha:$sha, actor:$actor }')
+          SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
+          curl -fsSL -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: sha256=$SIG" \
+            -d "$PAYLOAD"
+
+  # -----------------------------------------------------------------
+  # 5. Post Grafana deploy annotation — visible vertical line on every
+  #    dashboard at the moment the deploy is announced.
+  # -----------------------------------------------------------------
+  annotate-grafana:
+    needs: build-and-sign
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Post deploy annotation
+        env:
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+          GRAFANA_API_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          bash scripts/post-grafana-annotation.sh \
+            demo-api \
+            dev \
+            "${{ needs.build-and-sign.outputs.image-tag }}" \
+            "${GITHUB_SHA::7}"

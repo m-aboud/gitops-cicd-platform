@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and fill in.
+# Generate the bcrypt hash with:
+#   argocd account bcrypt --password 'your-strong-password'
+# or:
+#   htpasswd -bnBC 10 "" 'your-strong-password' | tr -d ':\n'
+
+region                       = "us-east-1"
+argocd_admin_password_bcrypt = "$2a$10$replace-me-with-real-bcrypt-hash"

@@ -1,0 +1,157 @@
+# WorkflowTemplate — reusable deploy pipeline invoked by the Sensor.
+#
+# Steps:
+#   1. verify-signature  — Cosign verifies the image was signed by our CI
+#   2. update-overlay    — patch the env overlay's kustomization to the new image
+#   3. sync              — kick Argo CD to reconcile immediately (instead of waiting)
+#   4. annotate-grafana  — post a deploy annotation to Grafana dashboards
+#
+# This pattern keeps the *real* CD logic (Argo CD reconciliation) in charge,
+# while Argo Events provides the trigger glue + audit trail in workflow logs.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: deploy-pipeline
+  namespace: argo-events
+spec:
+  entrypoint: deploy
+  arguments:
+    parameters:
+      - { name: app }
+      - { name: environment }
+      - { name: image }
+      - { name: version }
+      - { name: git-sha }
+
+  templates:
+    - name: deploy
+      dag:
+        tasks:
+          - name: verify
+            template: verify-signature
+            arguments:
+              parameters:
+                - { name: image, value: "{{workflow.parameters.image}}" }
+
+          - name: bump
+            dependencies: [verify]
+            template: bump-overlay
+            arguments:
+              parameters:
+                - { name: app,         value: "{{workflow.parameters.app}}" }
+                - { name: environment, value: "{{workflow.parameters.environment}}" }
+                - { name: image,       value: "{{workflow.parameters.image}}" }
+
+          - name: sync
+            dependencies: [bump]
+            template: argocd-sync
+            arguments:
+              parameters:
+                - { name: app,         value: "{{workflow.parameters.app}}" }
+                - { name: environment, value: "{{workflow.parameters.environment}}" }
+
+          - name: annotate
+            dependencies: [sync]
+            template: grafana-annotate
+            arguments:
+              parameters:
+                - { name: app,         value: "{{workflow.parameters.app}}" }
+                - { name: environment, value: "{{workflow.parameters.environment}}" }
+                - { name: version,     value: "{{workflow.parameters.version}}" }
+                - { name: git-sha,     value: "{{workflow.parameters.git-sha}}" }
+
+    # ----- 1. Cosign signature verification -----
+    - name: verify-signature
+      inputs:
+        parameters:
+          - { name: image }
+      container:
+        image: gcr.io/projectsigstore/cosign:v2.4.1
+        command: [cosign]
+        args:
+          - verify
+          - "{{inputs.parameters.image}}"
+          - --certificate-identity-regexp=https://github.com/mohammedabood/.+
+          - --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+
+    # ----- 2. Bump kustomize overlay -----
+    - name: bump-overlay
+      inputs:
+        parameters:
+          - { name: app }
+          - { name: environment }
+          - { name: image }
+      container:
+        image: alpine/git:2.45.2
+        command: [sh, -c]
+        args:
+          - |
+            set -euo pipefail
+            git clone --depth 1 https://github.com/mohammedabood/gitops-cicd-platform /tmp/repo
+            cd /tmp/repo
+            FILE="deployments/apps/{{inputs.parameters.app}}/overlays/{{inputs.parameters.environment}}/kustomization.yaml"
+            sed -i "s|newTag:.*|newTag: \"{{inputs.parameters.image}}\"|" "$FILE"
+            git -c user.email=ci@argo-events -c user.name=argo-events \
+                commit -am "deploy: {{inputs.parameters.app}} → {{inputs.parameters.environment}} via Argo Events"
+            git push https://x-access-token:$(cat /etc/git-creds/token)@github.com/mohammedabood/gitops-cicd-platform main
+        volumeMounts:
+          - { name: git-creds, mountPath: /etc/git-creds, readOnly: true }
+      volumes:
+        - name: git-creds
+          secret:
+            secretName: git-push-token
+
+    # ----- 3. Force Argo CD sync -----
+    - name: argocd-sync
+      inputs:
+        parameters:
+          - { name: app }
+          - { name: environment }
+      container:
+        image: quay.io/argoproj/argocd:v2.13.0
+        command: [sh, -c]
+        args:
+          - |
+            argocd login argocd-server.argocd:443 \
+              --username admin --password "$ARGOCD_PASSWORD" --insecure
+            argocd app sync "{{inputs.parameters.app}}-{{inputs.parameters.environment}}" \
+              --prune --force
+        env:
+          - name: ARGOCD_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: argocd-admin
+                key: password
+
+    # ----- 4. Post Grafana deploy annotation -----
+    - name: grafana-annotate
+      inputs:
+        parameters:
+          - { name: app }
+          - { name: environment }
+          - { name: version }
+          - { name: git-sha }
+      container:
+        image: curlimages/curl:8.10.1
+        command: [sh, -c]
+        args:
+          - |
+            curl -fsSL -X POST \
+              -H "Authorization: Bearer $GRAFANA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "$GRAFANA_URL/api/annotations" \
+              -d '{
+                "tags": ["deploy", "{{inputs.parameters.app}}", "{{inputs.parameters.environment}}"],
+                "text": "Deploy {{inputs.parameters.app}}@{{inputs.parameters.version}} → {{inputs.parameters.environment}} (sha {{inputs.parameters.git-sha}})"
+              }'
+        env:
+          - name: GRAFANA_URL
+            valueFrom:
+              secretKeyRef:
+                name: grafana-api
+                key: url
+          - name: GRAFANA_API_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: grafana-api
+                key: token

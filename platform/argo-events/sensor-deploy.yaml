@@ -1,0 +1,76 @@
+# Sensor — subscribes to events and decides what to do.
+#
+# This Sensor:
+#   1. Listens to the `release-webhook` EventSource
+#   2. Validates the payload has a non-empty image digest and known environment
+#   3. Triggers an Argo Workflow that runs the deploy pipeline
+#
+# Switch the dependency name to `release-kafka` to drive from Kafka instead.
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: release-deploy
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+
+  dependencies:
+    - name: release-event
+      eventSourceName: release-webhook
+      eventName: release
+      filters:
+        data:
+          # Required fields
+          - path: body.app
+            type: string
+            value: ["demo-api"]
+          - path: body.environment
+            type: string
+            value: ["dev", "staging", "prod"]
+          - path: body.image
+            type: string
+            # Reject empty digests; require pinned `@sha256:...`
+            value: ['.+@sha256:[a-f0-9]{64}$']
+            comparator: "=~"
+
+  triggers:
+    - template:
+        name: launch-deploy-workflow
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: deploy-
+                namespace: argo-events
+                labels:
+                  app.kubernetes.io/part-of: gitops-cicd-platform
+                  triggered-by: argo-events
+              spec:
+                serviceAccountName: argo-workflow-sa
+                entrypoint: deploy
+                arguments:
+                  parameters:
+                    - { name: app,         value: "" }
+                    - { name: environment, value: "" }
+                    - { name: image,       value: "" }
+                    - { name: version,     value: "" }
+                    - { name: git-sha,     value: "" }
+                workflowTemplateRef:
+                  name: deploy-pipeline
+
+          # Map event payload → workflow parameters
+          parameters:
+            - src:    { dependencyName: release-event, dataKey: body.app }
+              dest:   spec.arguments.parameters.0.value
+            - src:    { dependencyName: release-event, dataKey: body.environment }
+              dest:   spec.arguments.parameters.1.value
+            - src:    { dependencyName: release-event, dataKey: body.image }
+              dest:   spec.arguments.parameters.2.value
+            - src:    { dependencyName: release-event, dataKey: body.version }
+              dest:   spec.arguments.parameters.3.value
+            - src:    { dependencyName: release-event, dataKey: body.git_sha }
+              dest:   spec.arguments.parameters.4.value

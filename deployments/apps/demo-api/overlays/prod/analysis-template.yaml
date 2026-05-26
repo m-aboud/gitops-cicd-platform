@@ -1,0 +1,26 @@
+# AnalysisTemplate — queried during Rollout pauses.
+# Aborts the canary if the 5-min success rate on the canary service falls below 99%.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  args:
+    - name: service-name
+
+  metrics:
+    - name: success-rate
+      interval: 30s
+      successCondition: result[0] >= 0.99
+      failureLimit: 3       # 3 consecutive failures → abort
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring.svc.cluster.local
+          query: |
+            sum(rate(
+              demo_api_requests_total{service="{{args.service-name}}",status="200"}[5m]
+            ))
+            /
+            sum(rate(
+              demo_api_requests_total{service="{{args.service-name}}"}[5m]
+            ))

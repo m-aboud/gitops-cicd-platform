@@ -1,0 +1,59 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: demo
+  namespace: argocd
+spec:
+  description: "Project for demo applications across all environments."
+
+  # Where manifests can come from
+  sourceRepos:
+    - https://github.com/mohammedabood/gitops-cicd-platform
+
+  # Where they can deploy to
+  destinations:
+    - namespace: "demo-*"
+      server: https://kubernetes.default.svc
+    - namespace: "argo-rollouts"
+      server: https://kubernetes.default.svc
+
+  # Cluster-scoped resources allowed
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  # Namespace-scoped resources allowed
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: "*"
+    - group: apps
+      kind: "*"
+    - group: argoproj.io
+      kind: "*"
+    - group: networking.k8s.io
+      kind: "*"
+    - group: autoscaling
+      kind: "*"
+    - group: policy
+      kind: "*"
+    - group: external-secrets.io
+      kind: "*"
+
+  # Sync windows — example: block sync to prod outside business hours
+  # syncWindows:
+  #   - kind: deny
+  #     schedule: "0 22 * * *"
+  #     duration: 8h
+  #     applications:
+  #       - "*-prod"
+
+  # RBAC: who can act on apps in this project
+  roles:
+    - name: developer
+      description: "Developers can sync apps in dev/staging, not prod."
+      policies:
+        - p, proj:demo:developer, applications, sync, demo/*-dev, allow
+        - p, proj:demo:developer, applications, sync, demo/*-staging, allow
+        - p, proj:demo:developer, applications, sync, demo/*-prod, deny
+      groups:
+        - mohammedabood-org:developers

@@ -1,0 +1,78 @@
+name: policy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deployments/**"
+      - "platform/**"
+      - ".github/workflows/policy.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "deployments/**"
+      - "platform/**"
+
+permissions:
+  contents: read
+
+jobs:
+  manifest-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: yamllint
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: deployments/ platform/
+          config_data: |
+            extends: relaxed
+            rules:
+              line-length: { max: 200 }
+              trailing-spaces: enable
+
+      - name: Install kustomize
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Render & validate every overlay
+        run: |
+          set -euo pipefail
+          for o in deployments/apps/demo-api/overlays/*/; do
+            echo "=== $o ==="
+            kustomize build "$o" | kubeconform -strict -summary -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+
+  kyverno-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Kyverno CLI
+        run: |
+          curl -fsSL https://github.com/kyverno/kyverno/releases/latest/download/kyverno-cli_linux_x86_64.tar.gz \
+            | tar xz
+          sudo mv kyverno /usr/local/bin/
+
+      - name: Apply policies against rendered manifests (dry-run)
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+          for o in deployments/apps/demo-api/overlays/*/; do
+            echo "=== Applying policies to $o ==="
+            kustomize build "$o" > /tmp/rendered.yaml
+            kyverno apply platform/kyverno-policies/ \
+              --resource /tmp/rendered.yaml \
+              --policy-report
+          done

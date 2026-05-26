@@ -1,0 +1,42 @@
+# Alternative trigger source: a Kafka topic.
+#
+# This is the pattern for enterprises that already operate Kafka as the
+# event spine — release events land on the bus alongside everything else,
+# and CD becomes "just another consumer".
+#
+# Producer (CI pipeline writes a CloudEvent into kafka):
+#   {
+#     "specversion": "1.0",
+#     "type":        "com.example.release.requested",
+#     "source":      "github.com/mohammedabood/gitops-cicd-platform",
+#     "subject":     "demo-api/prod",
+#     "data": {
+#       "app": "demo-api",
+#       "environment": "prod",
+#       "image": "ghcr.io/...",
+#       "version": "1.2.3"
+#     }
+#   }
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: release-kafka
+  namespace: argo-events
+spec:
+  kafka:
+    release:
+      url: kafka-bootstrap.kafka.svc.cluster.local:9092
+      topic: platform.releases
+      partition: "0"
+      jsonBody: true
+      consumerGroup:
+        groupName: argo-events-cd
+        oldest: false
+        rebalanceStrategy: range
+      # Auth for managed Kafka (MSK, Strimzi, Confluent Cloud) — uncomment as needed:
+      # sasl:
+      #   mechanism: SCRAM-SHA-512
+      #   userSecret:    { name: kafka-creds, key: username }
+      #   passwordSecret:{ name: kafka-creds, key: password }
+      # tls:
+      #   caCertSecret:  { name: kafka-tls, key: ca.crt }

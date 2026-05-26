@@ -1,0 +1,64 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    ":automergePatch",
+    "schedule:weekends"
+  ],
+  "timezone": "Asia/Riyadh",
+  "labels": ["dependencies", "renovate"],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 8,
+
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into one PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Group Terraform provider updates",
+      "matchManagers": ["terraform"],
+      "matchDepTypes": ["required_provider"],
+      "groupName": "terraform-providers"
+    },
+    {
+      "description": "Group Python deps",
+      "matchManagers": ["pip_requirements", "pep621"],
+      "groupName": "python-deps"
+    },
+    {
+      "description": "Major upgrades go in their own PR; require manual review.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "addLabels": ["breaking-change"]
+    },
+    {
+      "description": "Pin distroless image digests",
+      "matchPackagePatterns": ["distroless"],
+      "pinDigests": true
+    }
+  ],
+
+  "kubernetes": {
+    "fileMatch": [
+      "^deployments/.+\\.yaml$",
+      "^platform/.+\\.yaml$"
+    ]
+  },
+
+  "terraform": {
+    "fileMatch": [
+      "^infrastructure/.+\\.tf$"
+    ]
+  },
+
+  "vulnerabilityAlerts": {
+    "labels": ["security", "priority/high"],
+    "automerge": false
+  }
+}

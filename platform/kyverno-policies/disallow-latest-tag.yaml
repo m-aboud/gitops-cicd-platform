@@ -1,0 +1,29 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow :latest tag
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Images must use a pinned, immutable tag — never `:latest` and never tagless.
+      Mutable tags break reproducibility, rollback, and signature verification.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Image tag is required. `:latest` and tagless images are not allowed."
+        pattern:
+          spec:
+            =(initContainers):
+              - image: "!*:latest & *:*"
+            containers:
+              - image: "!*:latest & *:*"
